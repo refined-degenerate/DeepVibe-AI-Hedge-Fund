@@ -1,0 +1,578 @@
+"""
+Live Alpaca bot for MAD / MRAT (equal-weight panel from local OHLCV SQLite).
+
+Reads the same ``data/ohlcv/*.db`` files as ``mad.backtester`` (run ``alpaca_fetcher`` first so closes
+are current). Optional ``MAD_LIVE_OHLCV_*`` checks staleness vs the reference ticker; optional
+``MAD_LIVE_REFRESH_SPLITTER_DB`` re-runs ``data_splitter`` once per UTC day so ``sma_*`` (and other
+precompute columns) match a manual splitter run. MRAT signals use **closes**, not those columns.
+
+Parameters default to the ``summary`` table in ``{MAD_DATA_DIR}/{ref}_{gran}_mad_optim.db`` when
+``MAD_LIVE_LOAD_PARAMS_FROM_DB`` is True.
+
+``MAD_LIVE_REGIME_OFF_PROXY_TICKER`` (e.g. BIL): when regime is risk-off (e.g. QQQ below its SMA),
+``MAD_LIVE_REGIME_OFF_CLOSE_ALL_NON_PROXY`` can flatten the whole account into that sleeve using
+``MAD_LIVE_REGIME_OFF_EQUITY_FRACTION`` of equity. Fetch OHLCV for the sleeve (include in pipeline).
+For after-hours tests: set ``MAD_LIVE_TRADE_ONLY_WHEN_MARKET_OPEN = False`` and
+``MAD_LIVE_EXTENDED_HOURS_ORDERS = True``.
+
+Usage:
+    PYTHONPATH=src python -m deepvibe_hedge.mad.live_bot --dry-run
+    PYTHONPATH=src python -m deepvibe_hedge.mad.live_bot --once
+    PYTHONPATH=src python -m deepvibe_hedge.mad.live_bot
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import io
+import math
+import sqlite3
+import time
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import requests
+from alpaca.trading.client import TradingClient
+
+from deepvibe_hedge import config
+from deepvibe_hedge.alpaca_asset import _alpaca_trading_keys
+from deepvibe_hedge.mad.backtester import (
+    compute_mad_live_snapshot,
+    mad_reference_ticker,
+    mad_regime_ticker_symbol,
+    mad_universe_tickers,
+)
+from deepvibe_hedge.alpaca_live import (
+    _apply_live_short_constraints,
+    _get_current_qty,
+    _latest_stock_trade_price,
+    _market_is_open,
+    _reconcile_symbol_net_qty,
+)
+from deepvibe_hedge.data_splitter import run_pipeline_for_ticker
+from deepvibe_hedge.mad.ohlcv_health import audit_mad_ohlcv_panel, print_health_report
+from deepvibe_hedge.paths import MAD_DATA_DIR, OHLCV_DIR
+
+_LAST_SPLITTER_REFRESH_UTC_DATE: date | None = None
+
+
+def _ohlcv_health_reference_ticker() -> str:
+    """
+    Calendar for OHLCV gap/staleness checks. Default follows ``mad_reference_ticker()`` (QQQ panel clock).
+
+    Override with ``MAD_LIVE_HEALTH_REFERENCE_TICKER`` when you need a different health baseline.
+    """
+    h = getattr(config, "MAD_LIVE_HEALTH_REFERENCE_TICKER", None)
+    if h is not None and str(h).strip():
+        return str(h).strip().upper()
+    return mad_reference_ticker().strip().upper()
+
+
+def _alpaca_ping_account(tc: TradingClient) -> None:
+    """Validate API connectivity; retries on transient TLS / network failures."""
+    n = max(1, int(getattr(config, "MAD_LIVE_ALPACA_CONNECT_RETRIES", 5)))
+    base = float(getattr(config, "MAD_LIVE_ALPACA_CONNECT_RETRY_SEC", 2.0))
+    last: BaseException | None = None
+    for i in range(n):
+        try:
+            tc.get_account()
+            return
+        except (requests.exceptions.RequestException, OSError) as exc:
+            last = exc
+            if i + 1 < n:
+                wait = base * float(i + 1)
+                print(
+                    f"  [Alpaca] connect failed ({type(exc).__name__}: {exc}); "
+                    f"retry {i + 2}/{n} in {wait:.1f}s..."
+                )
+                time.sleep(wait)
+    assert last is not None
+    raise last
+
+
+def _mad_optim_db_path() -> Path:
+    ref = mad_reference_ticker()
+    gran = str(config.TARGET_CANDLE_GRANULARITY)
+    return MAD_DATA_DIR / f"{ref}_{gran}_mad_optim.db"
+
+
+def load_mad_live_strategy_params() -> tuple[int, int, int, int, str | None]:
+    """
+    (sma_short, sma_long, exit_ma, regime_ma, regime_ticker_symbol).
+
+    If ``MAD_LIVE_LOAD_PARAMS_FROM_DB`` and ``summary`` exists: start from that row, then apply any
+    ``MAD_LIVE_*`` that is not None. Otherwise use strategy defaults, then the same overrides.
+    """
+    sh: int
+    lo: int
+    ex: int
+    rg: int
+    rt: str | None
+    loaded_db = False
+
+    use_db = bool(getattr(config, "MAD_LIVE_LOAD_PARAMS_FROM_DB", True))
+    path = _mad_optim_db_path()
+    if use_db and path.exists():
+        with sqlite3.connect(path) as con:
+            cur = con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='summary'"
+            )
+            if cur.fetchone():
+                df = pd.read_sql("SELECT * FROM summary LIMIT 1", con)
+                if not df.empty:
+                    row = df.iloc[0]
+                    sh = int(row["mad_sma_short"])
+                    lo = int(row["mad_sma_long"])
+                    ex = int(row.get("mad_exit_ma", 0) or 0)
+                    rg = int(row.get("mad_regime_ma", 0) or 0)
+                    rt = str(row.get("mad_regime_ticker", "") or "").strip() or None
+                    loaded_db = True
+
+    if not loaded_db:
+        sh = int(getattr(config, "MAD_SMA_SHORT", 21))
+        lo = int(getattr(config, "MAD_SMA_LONG", 200))
+        ex = int(getattr(config, "MAD_EXIT_MA_PERIOD", 0) or 0)
+        rg = 0
+        rt = mad_regime_ticker_symbol()
+
+    def _apply_live_int(name: str, current: int) -> int:
+        v = getattr(config, name, None)
+        return int(v) if v is not None else current
+
+    sh = _apply_live_int("MAD_LIVE_SMA_SHORT", sh)
+    lo = _apply_live_int("MAD_LIVE_SMA_LONG", lo)
+    ex = _apply_live_int("MAD_LIVE_EXIT_MA", ex)
+    rg = _apply_live_int("MAD_LIVE_REGIME_MA", rg)
+
+    live_sym = getattr(config, "MAD_LIVE_REGIME_TICKER", None)
+    if live_sym is not None:
+        s = str(live_sym).strip().upper()
+        rt = s if s else None
+
+    return sh, lo, ex, rg, rt
+
+
+def _maybe_refresh_splitter_dbs(*, force: bool = False) -> None:
+    """
+    Recompute splitter indicators into each pipeline symbol DB (same as ``python -m deepvibe_hedge.data_splitter``).
+    """
+    global _LAST_SPLITTER_REFRESH_UTC_DATE
+    if not bool(getattr(config, "MAD_LIVE_REFRESH_SPLITTER_DB", False)):
+        return
+    today = datetime.now(timezone.utc).date()
+    if (
+        not force
+        and bool(getattr(config, "MAD_LIVE_REFRESH_SPLITTER_ONCE_PER_UTC_DAY", True))
+        and _LAST_SPLITTER_REFRESH_UTC_DATE == today
+    ):
+        return
+    syms = tuple(config.ohlcv_pipeline_tickers())
+    print(
+        f"\n[MAD live] Splitter refresh: {len(syms)} symbol(s) → SMA/Donchian/ADX + splits written to OHLCV DBs..."
+    )
+    failed: list[tuple[str, str]] = []
+    for sym in syms:
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                run_pipeline_for_ticker(sym)
+        except Exception as exc:
+            failed.append((sym, str(exc)))
+    if failed:
+        for s, err in failed[:15]:
+            print(f"  [splitter] FAILED {s}: {err}")
+        if len(failed) > 15:
+            print(f"  [splitter] ... +{len(failed) - 15} more failures")
+        print("  [splitter] UTC-day throttle not advanced — fix errors; will retry next poll.")
+        return
+    print(f"  [splitter] OK — updated {len(syms)} DB/CSV pair(s).")
+    _LAST_SPLITTER_REFRESH_UTC_DATE = today
+
+
+def _run_ohlcv_health_check(reg_ma: int, reg_tick: str | None) -> None:
+    if not bool(getattr(config, "MAD_LIVE_OHLCV_HEALTH_CHECK", True)):
+        return
+    ref = _ohlcv_health_reference_ticker()
+    panel = mad_universe_tickers()
+    extra: list[str] = []
+    rma = int(reg_ma or 0)
+    if rma > 0:
+        et = _display_regime_ticker(rma, reg_tick)
+        if et != "off":
+            extra.append(et)
+    proxy = getattr(config, "MAD_LIVE_REGIME_OFF_PROXY_TICKER", None)
+    if proxy:
+        ps = str(proxy).strip().upper()
+        if ps:
+            extra.append(ps)
+    report = audit_mad_ohlcv_panel(
+        ohlcv_dir=OHLCV_DIR,
+        granularity=str(config.TARGET_CANDLE_GRANULARITY),
+        ref_ticker=ref,
+        panel_symbols=panel,
+        extra_symbols=tuple(extra),
+        recent_ref_bars=int(getattr(config, "MAD_LIVE_OHLCV_RECENT_REF_BARS", 60)),
+        max_stale_calendar_days=int(getattr(config, "MAD_LIVE_OHLCV_MAX_STALE_CALENDAR_DAYS", 1)),
+    )
+    print(
+        f"\n[MAD live] OHLCV health (panel + extras vs ref={ref}; "
+        f"MAD panel calendar symbol={mad_reference_ticker()})\n"
+    )
+    print_health_report(report)
+    if not report.ok and bool(getattr(config, "MAD_LIVE_ABORT_ON_OHLCV_ISSUES", False)):
+        raise RuntimeError("MAD live: OHLCV health check failed — fix fetch/split or relax config.")
+
+
+def _display_regime_ticker(reg_ma: int, reg_tick: str | None) -> str:
+    if int(reg_ma or 0) <= 0:
+        return "off"
+    if reg_tick:
+        return reg_tick
+    sym = mad_regime_ticker_symbol()
+    return sym or "QQQ"
+
+
+def _gross_notional_usd(trading_client: TradingClient) -> float:
+    frac = float(getattr(config, "MAD_LIVE_EQUITY_FRACTION", 0.98))
+    cap = getattr(config, "MAD_LIVE_MAX_GROSS_USD", None)
+    acct = trading_client.get_account()
+    equity = float(acct.equity)
+    raw = max(0.0, equity * frac)
+    if cap is not None:
+        raw = min(raw, float(cap))
+    return raw
+
+
+def _regime_off_sleeve_notional_usd(trading_client: TradingClient) -> float:
+    """Notional to hold in BIL (or other sleeve) when regime is risk-off — full-equity pivot."""
+    frac = float(getattr(config, "MAD_LIVE_REGIME_OFF_EQUITY_FRACTION", 0.995))
+    cap = getattr(config, "MAD_LIVE_MAX_GROSS_USD", None)
+    acct = trading_client.get_account()
+    equity = float(acct.equity)
+    raw = max(0.0, equity * frac)
+    if cap is not None:
+        raw = min(raw, float(cap))
+    return raw
+
+
+def _last_close_from_ohlcv_db(symbol: str) -> float:
+    """Latest close in local OHLCV SQLite (same path convention as fetcher/splitter)."""
+    sym = str(symbol).strip().upper()
+    path = OHLCV_DIR / f"{sym}_{config.TARGET_CANDLE_GRANULARITY}.db"
+    if not path.exists():
+        return float("nan")
+    with sqlite3.connect(path) as con:
+        row = con.execute(
+            "SELECT close FROM ohlcv ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+    if not row or row[0] is None:
+        return float("nan")
+    return float(row[0])
+
+
+def _px_for_reconcile(
+    symbol: str,
+    close_by_ticker: dict[str, float],
+    *,
+    paper: bool,
+) -> float:
+    """Reference price for extended-hours limits: snapshot → OHLCV → Alpaca last trade."""
+    sym = str(symbol).strip().upper()
+    p = float(close_by_ticker.get(sym, float("nan")))
+    if np.isfinite(p) and p > 0:
+        return p
+    p2 = _last_close_from_ohlcv_db(sym)
+    if np.isfinite(p2) and p2 > 0:
+        return p2
+    return _latest_stock_trade_price(sym, paper=paper)
+
+
+def _flatten_account_except_proxy(
+    trading_client: TradingClient,
+    *,
+    proxy_sym: str,
+    close_by_ticker: dict[str, float],
+    ext_hrs: bool,
+    paper: bool,
+) -> None:
+    """Sell/cover every open position except the sleeve ETF (regime-off full pivot)."""
+    px = proxy_sym.strip().upper()
+    for pos in trading_client.get_all_positions():
+        sym = str(pos.symbol).strip().upper()
+        if sym == px:
+            continue
+        cur = int(round(float(pos.qty)))
+        if cur == 0:
+            continue
+        ref_px = _px_for_reconcile(sym, close_by_ticker, paper=paper)
+        desired = 0
+        dq_clamped, short_note = _apply_live_short_constraints(
+            trading_client, sym, desired
+        )
+        print(
+            f"  {sym}: regime-off flatten px={ref_px:.4f} desired_net={dq_clamped:+d} current={cur:+d}"
+            f"{short_note}"
+        )
+        if dq_clamped != desired:
+            desired = dq_clamped
+        if desired != cur:
+            _reconcile_symbol_net_qty(
+                trading_client,
+                sym,
+                desired,
+                extended_hours=ext_hrs,
+                reference_price=ref_px if ext_hrs else None,
+                paper=paper,
+            )
+
+
+def _desired_shares_signed(weight: float, gross_usd: float, price: float) -> int:
+    if not np.isfinite(price) or price <= 0.0:
+        return 0
+    usd = float(weight) * float(gross_usd)
+    if abs(usd) < 1e-9:
+        return 0
+    mag = abs(usd) / price
+    q = int(math.floor(mag))
+    return int(math.copysign(q, usd))
+
+
+def _run_cycle(
+    trading_client: TradingClient | None,
+    *,
+    dry_run: bool,
+    min_order_usd: float,
+    paper: bool = True,
+) -> None:
+    utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+    sh, lo, ex, reg_ma, reg_tick = load_mad_live_strategy_params()
+    snap = compute_mad_live_snapshot(
+        short_w=sh,
+        long_w=lo,
+        exit_ma_period=ex,
+        regime_ma_period=reg_ma,
+        regime_ticker=reg_tick,
+    )
+    rma = int(snap.mad_regime_ma or 0)
+    reg_line = (
+        "regime off"
+        if rma <= 0
+        else f"regime MA={rma} ETF={_display_regime_ticker(rma, reg_tick)!r}"
+    )
+    proxy_raw = getattr(config, "MAD_LIVE_REGIME_OFF_PROXY_TICKER", None)
+    proxy_sym = str(proxy_raw).strip().upper() if proxy_raw else ""
+    use_bil_sleeve = bool(proxy_sym) and not snap.regime_ok
+    close_all_np = bool(
+        use_bil_sleeve
+        and getattr(config, "MAD_LIVE_REGIME_OFF_CLOSE_ALL_NON_PROXY", True)
+    )
+    ext_hrs = bool(getattr(config, "MAD_LIVE_EXTENDED_HOURS_ORDERS", False))
+
+    if not dry_run:
+        assert trading_client is not None
+        gross = _gross_notional_usd(trading_client)
+        sleeve_notional = (
+            _regime_off_sleeve_notional_usd(trading_client) if use_bil_sleeve else float("nan")
+        )
+    else:
+        gross = float("nan")
+        sleeve_notional = float("nan")
+
+    print(
+        f"\n[{utc_now}] MAD live cycle\n"
+        f"  as_of UTC date   : {snap.as_of.date()}\n"
+        f"  MRAT SMA         : {snap.mad_sma_short}/{snap.mad_sma_long} | exit MA={snap.mad_exit_ma or 'off'} | "
+        f"{reg_line}\n"
+        f"  regime risk-on   : {snap.regime_ok}\n"
+        f"  raw long / short : {snap.n_long} / {snap.n_short}\n"
+        f"  regime sleeve    : {proxy_sym or 'cash'} (active={'yes' if use_bil_sleeve else 'no — MRAT book'})\n"
+        f"  extended_hours   : {ext_hrs}\n"
+    )
+
+    if dry_run:
+        print("  [dry-run] targets (weight, close, implied USD leg @ $100k gross example):")
+        ex_gross = 100_000.0
+        for t in snap.tickers:
+            w = snap.weight_by_ticker.get(t, 0.0)
+            px = snap.close_by_ticker.get(t, float("nan"))
+            leg = ex_gross * abs(w)
+            print(f"    {t:6s} w={w:+.4f} close={px:.4f} leg≈${leg:,.0f}")
+        if proxy_sym:
+            pxp = _last_close_from_ohlcv_db(proxy_sym)
+            re_frac = float(getattr(config, "MAD_LIVE_REGIME_OFF_EQUITY_FRACTION", 0.995))
+            ex_sleeve = ex_gross * re_frac if use_bil_sleeve else 0.0
+            bil_q = _desired_shares_signed(1.0, ex_sleeve, pxp) if use_bil_sleeve else 0
+            print(
+                f"    {proxy_sym:6s} sleeve {'ON' if use_bil_sleeve else 'off'} "
+                f"close={pxp:.4f} shares≈{bil_q:+d} @ ${ex_sleeve:,.0f} regime-off notional "
+                f"(close_all_non_proxy={close_all_np})"
+            )
+        return
+
+    print(f"  gross notional USD : {gross:,.2f} (MRAT equity fraction + cap)")
+    if use_bil_sleeve:
+        print(
+            f"  regime-off sleeve  : ${sleeve_notional:,.2f} "
+            f"({float(getattr(config, 'MAD_LIVE_REGIME_OFF_EQUITY_FRACTION', 0.995)):.4f} × equity) | "
+            f"close_all_non_proxy={close_all_np}\n"
+        )
+    else:
+        print()
+
+    if use_bil_sleeve and close_all_np:
+        _flatten_account_except_proxy(
+            trading_client,
+            proxy_sym=proxy_sym,
+            close_by_ticker=snap.close_by_ticker,
+            ext_hrs=ext_hrs,
+            paper=paper,
+        )
+    else:
+        for t in snap.tickers:
+            w = snap.weight_by_ticker.get(t, 0.0)
+            if proxy_sym and t == proxy_sym and use_bil_sleeve:
+                continue
+            px = snap.close_by_ticker.get(t, float("nan"))
+            leg_usd = abs(w) * gross
+            if abs(w) > 1e-12 and leg_usd < float(min_order_usd):
+                desired = 0
+                note = f" | skipped leg ${leg_usd:.2f} < min_order"
+            else:
+                desired = _desired_shares_signed(w, gross, px)
+                note = ""
+
+            cur = int(round(_get_current_qty(trading_client, t)))
+            if desired == 0 and cur == 0:
+                continue
+
+            dq_clamped, short_note = _apply_live_short_constraints(trading_client, t, desired)
+            print(
+                f"  {t}: w={w:+.4f} px={px:.4f} desired_net={dq_clamped:+d} current={cur:+d}{short_note}{note}"
+            )
+            if dq_clamped != desired and short_note:
+                desired = dq_clamped
+
+            if desired != cur:
+                _reconcile_symbol_net_qty(
+                    trading_client,
+                    t,
+                    desired,
+                    extended_hours=ext_hrs,
+                    reference_price=px if ext_hrs else None,
+                    paper=paper,
+                )
+
+    if proxy_sym:
+        bil_px = _last_close_from_ohlcv_db(proxy_sym)
+        if use_bil_sleeve:
+            bil_usd = float(sleeve_notional)
+            if bil_usd < float(min_order_usd):
+                bil_desired = 0
+                bil_note = f" | skipped sleeve ${bil_usd:.2f} < min_order"
+            else:
+                bil_desired = _desired_shares_signed(1.0, gross, bil_px)
+                bil_note = ""
+        else:
+            bil_desired = 0
+            bil_note = ""
+        bil_cur = int(round(_get_current_qty(trading_client, proxy_sym)))
+        if bil_desired != bil_cur or bil_note:
+            print(
+                f"  {proxy_sym}: sleeve={'risk-off full gross' if use_bil_sleeve else 'flat'} "
+                f"px={bil_px:.4f} desired_net={bil_desired:+d} current={bil_cur:+d}{bil_note}"
+            )
+        if bil_desired != bil_cur:
+            _reconcile_symbol_net_qty(
+                trading_client,
+                proxy_sym,
+                bil_desired,
+                extended_hours=ext_hrs,
+                reference_price=bil_px if ext_hrs else None,
+                paper=paper,
+            )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="MAD / MRAT Alpaca live bot")
+    parser.add_argument("--once", action="store_true", help="Single cycle then exit.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print targets only; no orders (no account query for gross sizing).",
+    )
+    args = parser.parse_args()
+
+    paper = bool(getattr(config, "MAD_LIVE_PAPER", getattr(config, "LIVE_BOT_PAPER", True)))
+    poll = max(int(getattr(config, "MAD_LIVE_POLL_SECONDS", 300)), 30)
+    trade_open = bool(getattr(config, "MAD_LIVE_TRADE_ONLY_WHEN_MARKET_OPEN", True))
+    min_order = float(getattr(config, "MAD_LIVE_MIN_ORDER_USD", 1.0))
+
+    sh, lo, ex, reg_ma, reg_tick = load_mad_live_strategy_params()
+    regime_disp = _display_regime_ticker(reg_ma, reg_tick)
+    mode = "PAPER" if paper else "LIVE"
+    panel_syms = mad_universe_tickers()
+    pipe_mode = str(getattr(config, "OHLCV_PIPELINE_MODE", "mad_universe")).strip()
+    fetch_syms = tuple(config.ohlcv_pipeline_tickers())
+    fetch_set = set(fetch_syms)
+    missing_panel = sorted(set(panel_syms) - fetch_set)
+    print(
+        f"\nMAD / MRAT live bot\n"
+        f"  mode            : {mode}\n"
+        f"  MAD ref (panel) : {mad_reference_ticker()}  (``mad.backtester.MAD_PANEL_REFERENCE_TICKER``)\n"
+        f"  OHLCV health ref: {_ohlcv_health_reference_ticker()}  (equity calendar when sleeve == ref)\n"
+        f"  bar granularity : {config.TARGET_CANDLE_GRANULARITY}\n"
+        f"  MAD panel       : {len(panel_syms)} names (MAD_UNIVERSE_TICKERS)\n"
+        f"  OHLCV pipeline  : {pipe_mode!r} → {len(fetch_syms)} fetch symbol(s) (``alpaca_fetcher``)\n"
+        f"  params          : MRAT {sh}/{lo} exit_MA={ex} regime_MA={reg_ma} ticker={regime_disp!r}\n"
+        f"  optim DB        : {_mad_optim_db_path()} (load={getattr(config, 'MAD_LIVE_LOAD_PARAMS_FROM_DB', True)})\n"
+        f"  RTH-only cycles : {trade_open} (False + extended_hours orders → after-hours testing)\n"
+        f"  extended_hours  : {getattr(config, 'MAD_LIVE_EXTENDED_HOURS_ORDERS', False)}\n"
+        f"  regime sleeve   : {getattr(config, 'MAD_LIVE_REGIME_OFF_PROXY_TICKER', None) or 'cash'}\n"
+        f"  poll_seconds    : {poll}\n"
+        f"  dry_run         : {args.dry_run}\n"
+    )
+    if missing_panel:
+        sample = ", ".join(missing_panel[:12])
+        more = f" (+{len(missing_panel) - 12} more)" if len(missing_panel) > 12 else ""
+        print(
+            "  WARNING: MAD universe includes symbols not in ``ohlcv_pipeline_tickers()`` — "
+            "those DBs will be missing unless you fetched them another way.\n"
+            f"    Missing vs pipeline: {sample}{more}\n"
+        )
+
+    _run_ohlcv_health_check(reg_ma, reg_tick)
+
+    if args.dry_run:
+        _run_cycle(None, dry_run=True, min_order_usd=min_order, paper=paper)
+        return
+
+    key, secret = _alpaca_trading_keys(paper=paper)
+    tc = TradingClient(api_key=key, secret_key=secret, paper=paper)
+    _alpaca_ping_account(tc)
+
+    startup_refresh = bool(getattr(config, "MAD_LIVE_REFRESH_SPLITTER_ON_STARTUP", True))
+    first_loop = True
+
+    while True:
+        if first_loop and startup_refresh:
+            _maybe_refresh_splitter_dbs(force=False)
+        first_loop = False
+
+        if trade_open and not _market_is_open(tc):
+            now_txt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+            print(f"[{now_txt}] Market closed. Waiting {poll}s...")
+        else:
+            try:
+                _run_cycle(tc, dry_run=False, min_order_usd=min_order, paper=paper)
+                _maybe_refresh_splitter_dbs(force=False)
+            except Exception as exc:
+                print(f"  ERROR: {exc}")
+        if args.once:
+            break
+        time.sleep(poll)
+
+
+if __name__ == "__main__":
+    main()
