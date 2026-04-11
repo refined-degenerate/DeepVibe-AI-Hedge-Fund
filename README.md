@@ -31,7 +31,7 @@ You will need a few free tools. None of this replaces reading the rest of the gu
 
 | Piece | Why it matters |
 |------|----------------|
-| **[Docker Desktop](https://www.docker.com/products/docker-desktop/)** (recommended) or local Python | A reliable way to run the same Python version and libraries this repo expects. |
+| **[Docker Desktop](https://www.docker.com/products/docker-desktop/)** (recommended) or local Python | Required for **Dev Containers** in Cursor; or use Docker only for a manual shell; or skip Docker and use local Python ([How to run the code](#how-to-run-the-code)). |
 | A **code editor** with a terminal | Open files, paste API keys, and run commands in one place. |
 | **[Git](https://git-scm.com/downloads)** | Download this repository from GitHub (**clone**). |
 | A **[GitHub](https://github.com)** account (optional but common) | Fork or star the repo, open issues, or contribute. |
@@ -55,7 +55,9 @@ Docker runs a small **Linux environment** on your computer so you can use the ex
 
 **Linux:** You usually install **[Docker Engine](https://docs.docker.com/engine/install/)** instead of Docker Desktop (same idea for this project).
 
-**Important:** This repository does **not** ship a custom image. You will start an official **`python:3.12-bookworm`** container and install the project inside it ([How to run the code](#how-to-run-the-code)). That is intentional and keeps the README simple.
+**Dev Containers (recommended in [How to run the code](#how-to-run-the-code)):** Docker Desktop must be **running** so Cursor (or VS Code) can build the environment from **`.devcontainer/devcontainer.json`**. You do **not** type `docker run` yourself for that path.
+
+**Manual Docker shell (optional):** You can instead start an official **`python:3.12-bookworm`** container by hand; see **Option B** under [step 1](#1-run-a-python-environment-choose-one) in [How to run the code](#how-to-run-the-code).
 
 ### Code editor and terminal
 
@@ -133,6 +135,8 @@ cd "/path/to/DeepVibe AI Hedge Fund"
 
 4. **Open the project in your editor:** **File → Open Folder** and select the **repository root** (the folder that contains `README.md` and `pyproject.toml`). From now on, every command in this README assumes the terminal’s current directory is that root.
 
+5. **Easiest setup (Cursor):** jump to [How to run the code](#how-to-run-the-code), step **1 Option A**, and use **Dev Containers: Reopen in Container** so `.devcontainer/devcontainer.json` builds the dev environment automatically (Docker Desktop must be running).
+
 ---
 
 ## How to run the code
@@ -141,7 +145,27 @@ The steps below pick up after the repository is open on your machine. Complete t
 
 ### 1. Run a Python environment (choose one)
 
-#### Option A — Docker (recommended for beginners)
+#### Option A — Cursor / VS Code Dev Container (recommended)
+
+This is the simplest path: the repo includes **`.devcontainer/devcontainer.json`**, which defines the image and setup Cursor uses when you reopen the folder **inside** a container.
+
+**Requirements**
+
+- **[Docker Desktop](https://www.docker.com/products/docker-desktop/)** (or another Docker engine) is **running**.
+- **[Cursor](https://cursor.com)** or **[Visual Studio Code](https://code.visualstudio.com/)** with **Dev Containers** support. (Cursor follows the same workflow; if anything is missing, install the **Dev Containers** extension from the marketplace, same as VS Code.)
+
+**Steps**
+
+1. Open the **repository root** in Cursor (already done if you followed [Clone this project and open it locally](#clone-this-project-and-open-it-locally)).
+2. Open the **Command Palette**: **Ctrl+Shift+P** (Windows / Linux) or **Cmd+Shift+P** (Mac).
+3. Run **`Dev Containers: Reopen in Container`**.
+4. Wait for the first build to finish (it can take several minutes). Cursor will reload the window when the dev container is ready.
+
+Your integrated terminal is then **inside** that container; use it for every **`pip`** and **`python`** command below until you leave the dev container.
+
+Details of the image and `postCreate` steps live in **`.devcontainer/devcontainer.json`** if you need to change them. General reference: **[Developing inside a Container](https://code.visualstudio.com/docs/devcontainers/containers)** (VS Code docs; Cursor behaves the same way).
+
+#### Option B — Manual Docker shell (optional)
 
 From your **project root** (the folder that contains `README.md` and `pyproject.toml`), run:
 
@@ -159,7 +183,7 @@ docker run -it --rm -v "${PWD}:/workspace" -w /workspace python:3.12-bookworm ba
 
 You should see a Linux prompt. **Stay inside this container** for all `pip` and `python` commands until you type `exit`.
 
-#### Option B — Python on your computer
+#### Option C — Python on your computer
 
 1. Install **Python 3.10 or newer** from **[python.org/downloads](https://www.python.org/downloads/)** (on Windows, enable **Add Python to PATH** if the installer offers it).
 2. In the project folder, create a virtual environment and activate it:
@@ -371,7 +395,7 @@ The first MRAT panel build can take **several minutes** while it reads many SQLi
 | `ModuleNotFoundError` | `PYTHONPATH=src` (or PowerShell `$env:PYTHONPATH="src"`) in **this** terminal session ([step 3](#3-tell-python-where-the-code-lives-pythonpath)). |
 | Alpaca errors | `.env` keys, **paper vs live** keys matching `BOT_MODE` in `config.py`. |
 | Backtest says not enough tickers | You need enough symbols with OHLCV databases; run the **fetcher** for the full universe ([step 6a](#6a-download-daily-prices-alpaca-to-sqlite)). |
-| Docker volume empty on Windows | Use **PowerShell** and `${PWD}` as in [step 1](#1-run-a-python-environment-choose-one), and ensure Docker Desktop file sharing includes your drive. |
+| Docker volume empty on Windows | For **manual** `docker run`, use **PowerShell** and `${PWD}` as in [step 1](#1-run-a-python-environment-choose-one) **Option B**, and ensure Docker Desktop file sharing includes your drive. For **Dev Containers**, check Docker Desktop is running and see [VS Code Dev Containers troubleshooting](https://code.visualstudio.com/docs/devcontainers/troubleshooting). |
 | Port already in use | Change **`MAD_DASHBOARD_PORT`** in `config.py` (backtest) or edit **`DASHBOARD_PORT`** in `mad/live_dashboard.py` (live UI). |
 
 ---
@@ -380,6 +404,7 @@ The first MRAT panel build can take **several minutes** while it reads many SQLi
 
 | Path | Role |
 |------|------|
+| `.devcontainer/devcontainer.json` | Dev Container definition for **Reopen in Container** in Cursor / VS Code |
 | `src/deepvibe_hedge/config.py` | Universe, dates, splitter, MAD grids, live flags, `BOT_MODE` |
 | `src/deepvibe_hedge/alpaca_fetcher.py` | Historical bars → `data/ohlcv/{SYMBOL}_{gran}.db` + `.csv` |
 | `src/deepvibe_hedge/data_splitter.py` | Splits + SMA columns |
