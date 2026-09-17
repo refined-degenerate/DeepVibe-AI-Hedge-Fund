@@ -78,13 +78,18 @@ from deepvibe_hedge.mad.regime_sleeve import (
     resolve_sleeve_weighting_scheme,
 )
 from deepvibe_hedge.mad.index_allocator import (
+    BREADTH_RISK_PARITY_SCHEME,
+    DEFAULT_REALIZED_VOL_LOOKBACK,
     RISK_OFF_KEY,
+    _progressive_blend_row,
+    book_vol_from_weights,
     build_index_allocation_series,
     evaluate_index_allocation_live,
     filter_universe_by_data_completeness,
     format_index_allocation_banner,
     index_allocator_enabled,
     resolve_index_mrat_pair,
+    resolve_index_redistribute_to_survivors,
     resolve_index_regime_ma,
     resolve_index_slots,
     resolve_index_weight_config,
@@ -1261,6 +1266,7 @@ def compute_mad_multi_index_live_snapshot(
         ohlcv_dir=odir,
         aggregate_to_daily=daily_agg,
         prefer_precomputed_sma=use_pc,
+        redistribute_to_survivors=resolve_index_redistribute_to_survivors(config),
     )
     idx_weights = dict(allocation.index_weights)
     risk_off_share = float(allocation.risk_off_weight)
@@ -1317,6 +1323,40 @@ def compute_mad_multi_index_live_snapshot(
         per_slot_as_of[slot.etf] = slot_snap.as_of
         per_slot_n_long[slot.etf] = slot_snap.n_long
         per_slot_n_short[slot.etf] = slot_snap.n_short
+
+    # --- 2b. Breadth / risk-parity override (mrat_breadth_risk_parity only). --------
+    # Re-score the sleeve split from each slot's *held-book* realized vol + breadth
+    # (qualifying long count), mirroring the backtest so live matches research. The
+    # first-pass allocation above used the ETF proxy; here we have the real picks.
+    idx_wcfg_live = resolve_index_weight_config(config)
+    if (
+        idx_wcfg_live is not None
+        and idx_wcfg_live.scheme == BREADTH_RISK_PARITY_SCHEME
+    ):
+        lb_live = int(idx_wcfg_live.realized_vol_lookback or DEFAULT_REALIZED_VOL_LOOKBACK)
+        bv_live: dict[str, float] = {}
+        nq_live: dict[str, float] = {}
+        for slot in slots:
+            held = per_slot_weights.get(slot.etf, {})
+            bv_live[slot.etf] = book_vol_from_weights(
+                held,
+                granularity=gran,
+                ohlcv_dir=odir,
+                aggregate_to_daily=daily_agg,
+                lookback=lb_live,
+            )
+            nq_live[slot.etf] = float(per_slot_n_long.get(slot.etf, 0))
+        new_w, new_ro = _progressive_blend_row(
+            mrat_scores=dict(allocation.index_mrat),
+            trend_ok=dict(allocation.index_trend_ok),
+            weight_cfg=idx_wcfg_live,
+            rvol_by_key=None,
+            book_vol_by_key=bv_live,
+            n_qual_by_key=nq_live,
+            redistribute_to_survivors=resolve_index_redistribute_to_survivors(config),
+        )
+        idx_weights = dict(new_w)
+        risk_off_share = float(new_ro)
 
     # --- 3. Risk-off sleeve composition (always build, scale by risk_off_share). ----
     sleeve_w_raw: dict[str, float] = {}
@@ -1660,6 +1700,7 @@ def portfolio_path_from_panel(
     bh_log_list: list[float] = []
     flip_list: list[int] = []
     abs_w_list: list[float] = []
+    n_long_list: list[int] = []
     regime_state_list: list[str] = []
     sleeve_desc_list: list[str] = []
     w_prev = pd.Series(0.0, index=ret_piv.columns, dtype=float)
@@ -1685,6 +1726,10 @@ def portfolio_path_from_panel(
             w_core = _weights_from_entries(er)
         w = pd.Series(0.0, index=all_cols, dtype=float)
         w.loc[w_core.index] = w_core.to_numpy()
+        # Per-date count of long names in the (pre-regime) MRAT book. Surfaced so
+        # the multi-index ``mrat_breadth_risk_parity`` allocator can score each
+        # sleeve by its breadth (N_qualifiers). Harmless extra column otherwise.
+        n_long_list.append(int((w_core > 0).sum()))
         if allow_arr[j]:
             regime_state_list.append("risk-on")
             long_w = float(w[w > 0].sum())
@@ -1741,6 +1786,7 @@ def portfolio_path_from_panel(
             "net_log_return": net_log_list,
             "flip": flip_list,
             "abs_weight_sum": abs_w_list,
+            "n_long": n_long_list,
             "regime_state": regime_state_list,
             "sleeve_desc": sleeve_desc_list,
         }
@@ -2122,15 +2168,17 @@ def evaluate_mad_multi_index(
         )
 
     # 1. Top-level allocation series (per-date index weights + risk-off share).
+    idx_wcfg = resolve_index_weight_config(config)
     allocation = build_index_allocation_series(
         slots=slots,
         regime_ma=resolve_index_regime_ma(config),
         mrat_pair=resolve_index_mrat_pair(config),
-        weight_cfg=resolve_index_weight_config(config),
+        weight_cfg=idx_wcfg,
         granularity=gran,
         ohlcv_dir=OHLCV_DIR,
         aggregate_to_daily=daily_agg,
         prefer_precomputed_sma=False,
+        redistribute_to_survivors=resolve_index_redistribute_to_survivors(config),
     )
     if allocation.index_weights_piv.empty:
         raise RuntimeError("evaluate_mad_multi_index: allocation series empty.")
@@ -2198,11 +2246,16 @@ def evaluate_mad_multi_index(
     per_slot_metrics: dict[str, dict[str, float]] = {}
     per_slot_eval_df: dict[str, pd.DataFrame] = {}
     per_slot_status: dict[str, str] = {}
+    # Per-date count of qualifying long names per slot — breadth (N_qualifiers)
+    # for the ``mrat_breadth_risk_parity`` index allocator. Cached alongside
+    # returns so index-scheme grid reruns can reuse it.
+    per_slot_breadth: dict[str, pd.Series] = {}
     _use_cache = _per_slot_cache is not None
     if _use_cache:
         per_slot_returns = dict(_per_slot_cache["per_slot_returns"])
         per_slot_metrics = dict(_per_slot_cache["per_slot_metrics"])
         per_slot_status = dict(_per_slot_cache["per_slot_status"])
+        per_slot_breadth = dict(_per_slot_cache.get("per_slot_breadth", {}))
         if _verbose:
             print("  [per-slot cache hit] reusing stock-picker + sleeve returns")
 
@@ -2273,6 +2326,8 @@ def evaluate_mad_multi_index(
         per_slot_eval_df[slot.etf] = eval_df_s
         ret_series = eval_df_s["net_log_return"].dropna()
         per_slot_returns[slot.etf] = np.expm1(ret_series)  # simple return
+        if "n_long" in eval_df_s.columns:
+            per_slot_breadth[slot.etf] = eval_df_s["n_long"].astype(float)
         # Additional diagnostic: "days with position" is in metrics if evaluate_mad fills it.
         days_pos = metrics_s.get("days_with_position", None)
         bars = int(metrics_s.get("bars", 0))
@@ -2334,6 +2389,94 @@ def evaluate_mad_multi_index(
                 daily_agg=daily_agg,
                 ohlcv_dir=OHLCV_DIR,
             )
+
+    # 3b. Breadth / risk-parity override (mrat_breadth_risk_parity only).
+    #
+    # The standard schemes score sleeves from the ETF proxy (MRAT + ETF rvol),
+    # which is all ``build_index_allocation_series`` can see before the pickers
+    # run. Now that the per-slot books exist, re-derive the *equity split* across
+    # passing sleeves from the real book stats:
+    #     score ∝ |MRAT − 1| × (1 / σ_book) × √N_qualifiers
+    #   * σ_book — trailing realized vol of the slot's actual book return series
+    #     (``per_slot_returns``), shifted 1 bar so we never use today's return.
+    #   * N_qualifiers — qualifying long-name count that day (``per_slot_breadth``).
+    # The trend-driven risk-off share per date is preserved untouched.
+    if idx_wcfg is not None and idx_wcfg.scheme == BREADTH_RISK_PARITY_SCHEME:
+        cal_idx = allocation.index_weights_piv.index
+        lb_o = int(idx_wcfg.realized_vol_lookback or DEFAULT_REALIZED_VOL_LOOKBACK)
+        etf_cols_o = [s.etf for s in slots]
+        bookvol_by_etf: dict[str, pd.Series] = {}
+        breadth_by_etf: dict[str, pd.Series] = {}
+        for s in slots:
+            rr = per_slot_returns.get(s.etf)
+            if rr is not None and not rr.empty:
+                r2 = rr.copy()
+                r2.index = pd.DatetimeIndex(r2.index, tz="UTC").normalize()
+                r2 = r2.groupby(level=0).last()
+                bookvol_by_etf[s.etf] = (
+                    r2.rolling(max(2, lb_o), min_periods=max(2, lb_o // 2))
+                    .std(ddof=1)
+                    .shift(1)
+                    .reindex(cal_idx)
+                )
+            nb = per_slot_breadth.get(s.etf)
+            if nb is not None and not nb.empty:
+                n2 = nb.copy()
+                n2.index = pd.DatetimeIndex(n2.index, tz="UTC").normalize()
+                breadth_by_etf[s.etf] = n2.groupby(level=0).last().reindex(cal_idx)
+        mrat_piv_o = allocation.index_mrat
+        trend_piv_o = allocation.index_trend_ok
+        ovr_rows: list[dict[str, float]] = []
+        for dt in cal_idx:
+            scores_row = {
+                c: (
+                    float(mrat_piv_o.at[dt, c])
+                    if (c in mrat_piv_o.columns and dt in mrat_piv_o.index
+                        and pd.notna(mrat_piv_o.at[dt, c]))
+                    else float("nan")
+                )
+                for c in etf_cols_o
+            }
+            trend_row = {
+                c: (
+                    bool(trend_piv_o.at[dt, c])
+                    if (c in trend_piv_o.columns and dt in trend_piv_o.index)
+                    else False
+                )
+                for c in etf_cols_o
+            }
+            bv_row = {
+                c: (
+                    float(bookvol_by_etf[c].at[dt])
+                    if (c in bookvol_by_etf and dt in bookvol_by_etf[c].index
+                        and pd.notna(bookvol_by_etf[c].at[dt]))
+                    else float("nan")
+                )
+                for c in etf_cols_o
+            }
+            nq_row = {
+                c: (
+                    float(breadth_by_etf[c].at[dt])
+                    if (c in breadth_by_etf and dt in breadth_by_etf[c].index
+                        and pd.notna(breadth_by_etf[c].at[dt]))
+                    else float("nan")
+                )
+                for c in etf_cols_o
+            }
+            per_idx_o, ro_o = _progressive_blend_row(
+                mrat_scores=scores_row,
+                trend_ok=trend_row,
+                weight_cfg=idx_wcfg,
+                rvol_by_key=None,
+                book_vol_by_key=bv_row,
+                n_qual_by_key=nq_row,
+                redistribute_to_survivors=resolve_index_redistribute_to_survivors(config),
+            )
+            row_o = {c: per_idx_o.get(c, 0.0) for c in etf_cols_o}
+            row_o[RISK_OFF_KEY] = ro_o
+            ovr_rows.append(row_o)
+        new_piv = pd.DataFrame(ovr_rows, index=cal_idx, columns=[*etf_cols_o, RISK_OFF_KEY])
+        allocation = dc_replace(allocation, index_weights_piv=new_piv)
 
     # 4. Blend per-date. Align every series to the allocation calendar.
     cal = allocation.index_weights_piv.index
@@ -2546,6 +2689,7 @@ def evaluate_mad_multi_index(
             "per_slot_returns": per_slot_returns,
             "per_slot_metrics": per_slot_metrics,
             "per_slot_status": per_slot_status,
+            "per_slot_breadth": per_slot_breadth,
             "sleeve_weights_piv": sleeve_weights_piv,
             "sleeve_ret_piv": sleeve_ret_piv,
         }
@@ -2855,14 +2999,15 @@ def main() -> None:
     parser.add_argument("--no-dashboard", action="store_true")
     parser.add_argument(
         "--single-index",
-        choices=("sp500", "nasdaq100", "russell2000"),
+        choices=("sp500", "nasdaq100", "russell2000", "space_sector", "china_adr"),
         default=None,
         help=(
             "Temporarily run in single-universe mode for one index (disables the "
             "multi-index allocator for this run only). "
             "sp500 → (SPY, MAD_UNIVERSE=sp500), "
             "nasdaq100 → (QQQ, MAD_UNIVERSE=nasdaq100), "
-            "russell2000 → (IWM, MAD_UNIVERSE=russell2000). "
+            "russell2000 → (IWM, MAD_UNIVERSE=russell2000), "
+            "space_sector → (UFO, MAD_UNIVERSE=space_sector). "
             "Uses the matching ETF as regime ticker."
         ),
     )
@@ -2876,11 +3021,15 @@ def main() -> None:
         from deepvibe_hedge.sp500 import sp500 as _sp500
         from deepvibe_hedge.nasdaq100 import nasdaq100 as _nasdaq100
         from deepvibe_hedge.russell2000 import russell2000 as _russell2000
+        from deepvibe_hedge.space_sector import space_sector as _space_sector
+        from deepvibe_hedge.china_adr import china_adr as _china_adr
 
         _SINGLE_INDEX_MAP = {
-            "sp500":      ("SPY", _sp500,      "S&P 500"),
-            "nasdaq100":  ("QQQ", _nasdaq100,  "NASDAQ-100"),
-            "russell2000":("IWM", _russell2000,"Russell 2000"),
+            "sp500":       ("SPY", _sp500,         "S&P 500"),
+            "nasdaq100":   ("QQQ", _nasdaq100,     "NASDAQ-100"),
+            "russell2000": ("IWM", _russell2000,   "Russell 2000"),
+            "space_sector":("UFO", _space_sector,  "Procure Space"),
+            "china_adr":   ("PGJ", _china_adr,     "China ADRs"),
         }
         etf, universe_tuple, label = _SINGLE_INDEX_MAP[args.single_index]
         config.MAD_INDEX_ALLOCATOR_ENABLED = False          # turn off the top-level allocator
@@ -3024,6 +3173,10 @@ def main() -> None:
             "inv_vol",
             "mrat_distance_inv_vol",
         )
+        # ``mrat_breadth_risk_parity`` is index-allocator-only (it consumes
+        # sleeve-level book vol + breadth, not per-name inputs), so it joins the
+        # index axis but NOT the stock/sleeve axes.
+        _index_schemes = (*_all_schemes, BREADTH_RISK_PARITY_SCHEME)
 
         gs = bool(getattr(config, "MAD_GRID_SEARCH_STOCK", False))
         gi = bool(getattr(config, "MAD_GRID_SEARCH_INDEX", False))
@@ -3050,7 +3203,7 @@ def main() -> None:
 
             if gi:
                 index_list = tuple(
-                    getattr(config, "MAD_INDEX_WEIGHTING_GRID", None) or _all_schemes
+                    getattr(config, "MAD_INDEX_WEIGHTING_GRID", None) or _index_schemes
                 )
             else:
                 _idx = getattr(config, "MAD_INDEX_WEIGHTING_SCHEME", None)

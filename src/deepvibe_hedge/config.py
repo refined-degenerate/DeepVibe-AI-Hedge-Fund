@@ -18,7 +18,7 @@ Typical pipeline (run once after fresh clone, then re-run step 3+ to iterate):
 
 The control panel covers the four decisions users actually tune:
 
-  * Which indexes run (SPY / QQQ / IWM)         → MAD_INDEX_ENABLED_ETFS
+  * Which indexes run (SPY / QQQ / IWM / UFO)   → MAD_INDEX_ENABLED_ETFS
   * Risk-on / index / risk-off schemes            → section 3
   * Cartesian grid axes (any combo, 7×7×7 max)    → ``MAD_GRID_SEARCH_*`` (section 5)
   * Paper vs live brokerage                      → BOT_MODE
@@ -29,9 +29,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from deepvibe_hedge.china_adr import china_adr
 from deepvibe_hedge.hedge_assets import hedge_assets
 from deepvibe_hedge.nasdaq100 import nasdaq100
 from deepvibe_hedge.russell2000 import russell2000
+from deepvibe_hedge.space_sector import space_sector
 from deepvibe_hedge.sp500 import sp500
 
 # =============================================================================
@@ -63,14 +65,21 @@ MAD_INDEX_ALLOCATOR_ENABLED = True
 # them using the index ETF's own MRAT. Each sleeve has its own 200D trend
 # filter; failing slots route their weight to the risk-off sleeve (section 9).
 #
-#   None                 → run all three (IWM + QQQ + SPY, ~2449 names)
+# Every enabled slot (SPY, UFO, …) uses the **same** global rules — no
+# slot-specific overrides:
+#   * sleeve on/off     → ``MAD_INDEX_REGIME_MA`` (200D SMA on the slot ETF)
+#   * sleeve balance    → ``MAD_INDEX_WEIGHTING_SCHEME`` (across passing slots)
+#   * within-sleeve stocks → ``MAD_WEIGHTING_SCHEME`` (inside each slot's book)
+#
+#   None                 → run all four (IWM + QQQ + SPY + UFO, ~2500 names)
 #   ("QQQ", "SPY")       → drop small-caps, keep NASDAQ-100 + S&P 500 (~519)
 #   ("SPY",)             → S&P 500 only
+#   ("SPY", "UFO")       → S&P 500 + Procure Space (~550 names, ~30 UFO-exclusive)
 #   ("QQQ",)             → NASDAQ-100 only (equivalent to legacy single-universe)
 #
 # Why drop IWM: small-caps have been a standalone drag (-25% over 5 yrs) and
 # their trend filter breaks ~50% of years, forcing excess risk-off.
-MAD_INDEX_ENABLED_ETFS: tuple[str, ...] | None = ("QQQ", "SPY")
+MAD_INDEX_ENABLED_ETFS: tuple[str, ...] | None = ("SPY", "QQQ")
 
 # -----------------------------------------------------------------------------
 # 3. Weighting schemes
@@ -86,22 +95,46 @@ MAD_INDEX_ENABLED_ETFS: tuple[str, ...] | None = ("QQQ", "SPY")
 #   "inv_vol"                  — 1/σ weighting (stable, vol-normalized)
 #   "mrat_distance_inv_vol"    — hybrid: MRAT tilt × vol normalization
 
-# Stock picker: applied to names within each index slot. ``mrat_distance``
-# weights each name ∝ (MRAT - 1) — a direct expression of the 21/200 MRAT
-# thesis. Names stretched further above their long SMA get more weight,
-# weakening names get less; no separate hyperparameter to tune (unlike
-# softmax τ) so it doesn't overfit to a specific eval window.
+# Stock picker: applied to names within **each** index slot (SPY, UFO, …) — same
+# scheme for every enabled sleeve. ``mrat_distance`` weights each name ∝ (MRAT - 1):
+# a direct expression of the 21/200 MRAT thesis. Names stretched further above
+# their long SMA get more weight, weakening names get less; no separate
+# hyperparameter to tune (unlike softmax τ) so it doesn't overfit to a specific
+# eval window. (Do NOT set this to ``inv_vol`` — that inverts the book, cutting
+# high-momentum/high-vol names like semis and over-weighting stable low-vol names.)
 MAD_WEIGHTING_SCHEME = "mrat_distance"
 
-# Top-level allocator: applied across the enabled index slots. When ``None``,
-# falls back to equal weight across slots that pass trend.
-# ``mrat_distance_inv_vol`` = MRAT-distance tilt × 1/σ normalization. At the
-# index level we only have 2-3 ETFs with very different vol profiles (IWM ≈
-# 1.5-2× SPY's daily vol), so pure MRAT tilt can over-allocate to the
-# highest-MRAT index even when its realized vol is much higher; the
-# inv-vol term keeps the mix balanced. Locked in from the 7×7 grid search
-# (QQQ+SPY, 2021-06 → 2026-04, winner by Sharpe = 1.11 @ +239%).
+# Top-level allocator: applied across the enabled index slots (SPY vs UFO, etc.).
+# When ``None``, falls back to equal weight across slots that pass trend.
+#
+# ``mrat_breadth_risk_parity`` (ACTIVE) — breadth- and risk-aware blended sleeve
+# score, one term per problem the ETF-proxy schemes had:
+#       sleeve_weight ∝ |MRAT − 1|  ×  (1 / σ_book)  ×  √(N_qualifiers)
+#   (a) |MRAT − 1| — momentum tilt; keep responsiveness to which sleeve trends.
+#   (b) 1 / σ_book — risk parity on the *actual selected book's* realized vol
+#       (not the ETF proxy), so a thin, volatile sleeve is down-weighted.
+#   (c) √N_qualifiers — breadth; a sleeve that only fielded 2 qualifiers shouldn't
+#       command the capital of a 50-name one.
+# Together these pull a 2-name UFO book from ~46% down to ~10-20% organically,
+# with NO hard cap (SATL/RDW land ~5-10% each instead of ~23%). σ_book / N are
+# measured *after* the per-slot pickers run (backtest: per-slot book returns +
+# per-date long count; live: held-book returns + live long count), then the
+# equity split is re-derived while the trend-driven risk-off share is preserved.
+#
+# ``mrat_distance_inv_vol`` — the previous default (MRAT-distance tilt × 1/σ on
+# the ETF proxy, no breadth term). Locked from the 7×7 grid search (QQQ+SPY,
+# 2021-06 → 2026-04, Sharpe = 1.11 @ +239%). Revert to this to disable breadth.
 MAD_INDEX_WEIGHTING_SCHEME: str | None = "mrat_distance_inv_vol"
+
+# Breadth exponent for ``mrat_breadth_risk_parity``: sleeve weight ∝ ... × N**exp.
+#   0.5 → √N (diversification-of-vol intuition; vol of an EW book ~ 1/√N)
+#   1.0 → linear N (penalize thin sleeves harder — a 2-name UFO sleeve drops from
+#         ~21% to ~5%, i.e. ~2.5% per name, vs ~10%/name under √N)
+#   >1.0 → all but excludes thin sleeves.
+# Set to 1.0: a sleeve fielding only 2 qualifiers shouldn't put ~10% in each name
+# just because its momentum is hot. Lower back toward 0.5 to let hot thin sleeves
+# (e.g. space in a melt-up) carry more weight.
+MAD_INDEX_BREADTH_EXPONENT = 1.0
 
 # Risk-off sleeve: applied to the hedge-asset basket (bonds + metals +
 # defensive ETFs) when an index fails its trend filter. When ``None``, the
@@ -363,24 +396,41 @@ MAD_REGIME_MA_GRID = (0, 50, 100, 150, 200)
 # assignment priority. A ticker present in multiple slots' universes is
 # claimed by the FIRST matching slot here.
 #
-# Current priority IWM → QQQ → SPY:
+# Current priority IWM → QQQ → SPY → UFO:
 #   * IWM claims ~1,930 small-caps first (Russell excludes mega-caps anyway)
 #   * QQQ claims all 102 NASDAQ-100 names untouched (Russell doesn't overlap)
-#   * SPY keeps every S&P name not already in NASDAQ-100 (~400 mid/large caps)
+#   * SPY keeps every S&P name not already claimed (~400 mid/large caps)
+#   * UFO keeps Procure Space names not already in SPY (~20 space-exclusive)
 #
 # Flipping to SPY → QQQ → IWM makes SPY claim every mega-cap first, which
 # shrinks QQQ's exclusive universe to ~15 ADRs and cripples its standalone
 # contribution. Keep the current order unless you have a specific reason.
 MAD_INDEX_SLOTS: tuple[tuple[str, tuple[str, ...], str], ...] = (
-    ("IWM", russell2000, "Russell 2000"),
-    ("QQQ", nasdaq100,   "NASDAQ-100"),
-    ("SPY", sp500,       "S&P 500"),
+    ("IWM", russell2000,    "Russell 2000"),
+    ("QQQ", nasdaq100,      "NASDAQ-100"),
+    ("SPY", sp500,          "S&P 500"),
+    ("UFO", space_sector,   "Procure Space"),
+    ("PGJ", china_adr,      "China ADRs"),
 )
 
 # Per-slot trend filter: each slot's ETF must be above its SMA(regime_ma)
 # for its slot to be active. A failing slot's weight routes to the risk-off
 # sleeve (progressive blending — 1/N per failing slot).
 MAD_INDEX_REGIME_MA = 200
+
+# Where a below-trend slot's share goes.
+#   False (classic) — progressive risk-off: a failing slot sends its 1/N share
+#     to the cash/bond risk-off sleeve. Risk-off share = (# failing) / (# slots).
+#   True  (rotate to survivors) — a failing slot's share is instead redistributed
+#     across the sleeves still above trend (by MAD_INDEX_WEIGHTING_SCHEME). The
+#     book stays fully invested as long as ≥1 slot passes trend; the risk-off
+#     sleeve only activates when EVERY slot is below its 200D SMA.
+# Rationale: with thematic sleeves (UFO/PGJ) that are below trend most of the
+# time, the classic mode parks their share in cash even when SPY/QQQ are ripping.
+# Rotate-to-survivors keeps that capital in the on sleeves instead of bonds, so
+# the thematic legs only add weight when they're actually trending (their upside)
+# without bleeding cash drag when they're not (their downside).
+MAD_INDEX_REDISTRIBUTE_TO_SURVIVORS = False
 
 # MRAT pair used to score each index ETF for the top-level allocation.
 MAD_INDEX_MRAT_SHORT = 21
@@ -588,40 +638,54 @@ def ohlcv_download_end_utc() -> datetime:
 def ohlcv_pipeline_tickers() -> tuple[str, ...]:
     """Symbols fetched by ``alpaca_fetcher`` / ``data_splitter`` (one DB each).
 
-    Always starts from ``MAD_UNIVERSE_TICKERS`` (risk-on), then unions in:
-      * regime gate ticker (``MAD_REGIME_TICKER`` if ``MAD_REGIME_MA_ENABLED``)
-      * hedge assets (if ``OHLCV_PIPELINE_INCLUDE_HEDGE_ASSETS``)
-      * multi-index ETFs + all slot constituents (if allocator is ON —
-        fetched for ALL slots even if some are filtered out by
-        ``MAD_INDEX_ENABLED_ETFS``, so toggling a slot back on is instant)
-      * regime-sleeve + multi-ticker-regime symbols
+    * Allocator **off** → ``MAD_UNIVERSE_TICKERS`` + regime ticker + hedge +
+      sleeve/regime extras.
+    * Allocator **on** → union of **enabled** ``MAD_INDEX_SLOTS`` only (honors
+      ``MAD_INDEX_ENABLED_ETFS``; ``None`` = all slots in ``MAD_INDEX_SLOTS``),
+      plus hedge + sleeve/regime extras. Legacy ``MAD_UNIVERSE_TICKERS`` is
+      skipped so unused index lists (e.g. Russell 2000 when only SPY+UFO run)
+      are not downloaded.
     """
-    raw = MAD_UNIVERSE_TICKERS
-    base: tuple[str, ...] = (
-        (raw.strip().upper(),)
-        if isinstance(raw, str)
-        else tuple(str(x).strip().upper() for x in raw if str(x).strip())
-    )
-    if MAD_REGIME_MA_ENABLED:
-        rt = (MAD_REGIME_TICKER or "").strip().upper()
-        if rt and rt not in base:
-            base = (*base, rt)
-    if OHLCV_PIPELINE_INCLUDE_HEDGE_ASSETS:
-        for t in _hedge_asset_tickers():
-            if t and t not in base:
-                base = (*base, t)
+    base: tuple[str, ...] = ()
+
     if MAD_INDEX_ALLOCATOR_ENABLED:
-        # Fetch EVERY slot's tickers, ignoring ``MAD_INDEX_ENABLED_ETFS``,
-        # so the user can flip an index on/off without a re-fetch.
+        enabled_raw = MAD_INDEX_ENABLED_ETFS
+        enabled: set[str] | None
+        if enabled_raw is None:
+            enabled = None
+        else:
+            enabled = {str(t).strip().upper() for t in enabled_raw if str(t).strip()}
+            if not enabled:
+                enabled = None
         for etf, universe, _label in MAD_INDEX_SLOTS:
             etf_sym = (etf or "").strip().upper()
-            if etf_sym and etf_sym not in base:
+            if not etf_sym:
+                continue
+            if enabled is not None and etf_sym not in enabled:
+                continue
+            if etf_sym not in base:
                 base = (*base, etf_sym)
             raw_universe = universe if not isinstance(universe, str) else (universe,)
             for t in raw_universe:
                 tt = str(t).strip().upper()
                 if tt and tt not in base:
                     base = (*base, tt)
+    else:
+        raw = MAD_UNIVERSE_TICKERS
+        base = (
+            (raw.strip().upper(),)
+            if isinstance(raw, str)
+            else tuple(str(x).strip().upper() for x in raw if str(x).strip())
+        )
+        if MAD_REGIME_MA_ENABLED:
+            rt = (MAD_REGIME_TICKER or "").strip().upper()
+            if rt and rt not in base:
+                base = (*base, rt)
+
+    if OHLCV_PIPELINE_INCLUDE_HEDGE_ASSETS:
+        for t in _hedge_asset_tickers():
+            if t and t not in base:
+                base = (*base, t)
     try:
         from deepvibe_hedge.mad.regime_sleeve import (  # noqa: PLC0415
             sleeve_and_regime_symbols,

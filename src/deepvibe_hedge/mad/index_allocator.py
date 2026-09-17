@@ -60,6 +60,7 @@ from deepvibe_hedge.mad.regime_sleeve import (
     _shift_entry_allow,
 )
 from deepvibe_hedge.mad.weighting import (
+    DEFAULT_BREADTH_EXPONENT,
     DEFAULT_EQUAL_BLEND,
     DEFAULT_REALIZED_VOL_LOOKBACK,
     DEFAULT_SOFTMAX_TAU,
@@ -72,10 +73,29 @@ RISK_OFF_KEY = "__risk_off__"
 """Reserved column name emitted by ``build_index_allocation_series`` for the
 share routed to the risk-off sleeve."""
 
+BREADTH_RISK_PARITY_SCHEME = "mrat_breadth_risk_parity"
+"""Index-allocator-only weighting scheme:
+
+    sleeve_weight ∝ |MRAT − 1| × (1 / σ_book) × √(N_qualifiers)
+
+Distinct from the seven per-name schemes in ``weighting.py`` because it consumes
+*sleeve-level* inputs that the per-name engine has no slot for: the realized vol
+of the **actual selected book** (``σ_book``, not the ETF proxy) and the number of
+qualifying long names (``N_qualifiers``). Handled directly in
+``_progressive_blend_row``; never dispatched to ``compute_weights``. ``σ_book`` /
+``N`` are only known *after* the per-slot stock-pickers run, so callers do a
+first (degraded) pass and then override with the real book stats."""
+
 DEFAULT_INDEX_REGIME_MA = 200
 DEFAULT_INDEX_MRAT_SHORT = 21
 DEFAULT_INDEX_MRAT_LONG = 200
 DEFAULT_MIN_DATA_COMPLETENESS = 0.8
+DEFAULT_REDISTRIBUTE_TO_SURVIVORS = False
+"""Default for ``MAD_INDEX_REDISTRIBUTE_TO_SURVIVORS`` — when False the classic
+progressive risk-off blend applies (a below-trend slot's 1/N share routes to
+cash/bonds). When True, a below-trend slot's share is instead spread across the
+sleeves that are still above trend (by the configured scheme), and the risk-off
+sleeve only activates when *every* slot is below trend."""
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +204,18 @@ def resolve_index_regime_ma(config_module: object) -> int:
     return int(v) if v is not None else DEFAULT_INDEX_REGIME_MA
 
 
+def resolve_index_redistribute_to_survivors(config_module: object) -> bool:
+    """Whether a below-trend slot's share rotates into the still-on sleeves
+    (``True``) instead of routing to the cash/bond risk-off sleeve (``False``)."""
+    return bool(
+        getattr(
+            config_module,
+            "MAD_INDEX_REDISTRIBUTE_TO_SURVIVORS",
+            DEFAULT_REDISTRIBUTE_TO_SURVIVORS,
+        )
+    )
+
+
 def resolve_index_mrat_pair(config_module: object) -> tuple[int, int]:
     s = int(getattr(config_module, "MAD_INDEX_MRAT_SHORT", DEFAULT_INDEX_MRAT_SHORT))
     l = int(getattr(config_module, "MAD_INDEX_MRAT_LONG", DEFAULT_INDEX_MRAT_LONG))
@@ -211,6 +243,9 @@ def resolve_index_weight_config(config_module: object) -> WeightConfig | None:
                 "MAD_WEIGHT_REALIZED_VOL_LOOKBACK",
                 DEFAULT_REALIZED_VOL_LOOKBACK,
             )
+        ),
+        breadth_exponent=float(
+            getattr(config_module, "MAD_INDEX_BREADTH_EXPONENT", DEFAULT_BREADTH_EXPONENT)
         ),
     )
 
@@ -263,6 +298,9 @@ def _progressive_blend_row(
     trend_ok: dict[str, bool],
     weight_cfg: WeightConfig | None,
     rvol_by_key: dict[str, float] | None = None,
+    book_vol_by_key: dict[str, float] | None = None,
+    n_qual_by_key: dict[str, float] | None = None,
+    redistribute_to_survivors: bool = False,
 ) -> tuple[dict[str, float], float]:
     """Compute one date's per-index weights + risk-off share.
 
@@ -274,6 +312,12 @@ def _progressive_blend_row(
     returns, with ``n = weight_cfg.realized_vol_lookback``). Required for the
     ``inv_vol`` / ``mrat_distance_inv_vol`` schemes; when missing or ``NaN``
     those schemes silently fall back to equal (via ``_inv_vol_mag``).
+
+    ``book_vol_by_key`` / ``n_qual_by_key`` — optional per-index *book* stats used
+    only by ``mrat_breadth_risk_parity``: realized vol of the selected book and
+    the count of qualifying long names. When absent the scheme degrades to ETF
+    rvol (``rvol_by_key``) and breadth=1, i.e. plain MRAT-tilt × inv-vol — the
+    backtest/live callers then override with the real post-pick stats.
     """
     keys = list(mrat_scores.keys())
     n_total = len(keys)
@@ -284,11 +328,58 @@ def _progressive_blend_row(
     if n_pass == 0:
         return {k: 0.0 for k in keys}, 1.0
 
-    equity_share = n_pass / n_total
-    risk_off_share = 1.0 - equity_share
+    if redistribute_to_survivors:
+        # Rotate every below-trend slot's share into the sleeves that are still
+        # on (by the scheme weights below). Stay fully invested as long as one
+        # slot passes trend; only the all-fail case above routes to cash.
+        equity_share = 1.0
+        risk_off_share = 0.0
+    else:
+        # Classic progressive risk-off: k of N failing slots send k/N to cash.
+        equity_share = n_pass / n_total
+        risk_off_share = 1.0 - equity_share
 
-    if weight_cfg is None or weight_cfg.scheme == "equal":
+    scheme = weight_cfg.scheme if weight_cfg is not None else "equal"
+    if weight_cfg is None or scheme == "equal":
         inner = {k: 1.0 / n_pass for k in passing}
+    elif scheme == BREADTH_RISK_PARITY_SCHEME:
+        # sleeve score = |MRAT − 1| × (1 / σ_book) × √N_qualifiers
+        #   * |MRAT − 1| : momentum tilt — keep responsiveness to which sleeve trends.
+        #   * 1 / σ_book : risk-parity on the *actual* selected book (not the ETF
+        #     proxy) so a thin, volatile sleeve (e.g. 2 micro-caps) is down-weighted.
+        #   * √N         : breadth — a sleeve that only fielded a couple qualifiers
+        #     shouldn't command the capital of a broad one (this is the term that
+        #     pulls a 2-name UFO book down from ~46% organically, no hard cap).
+        # σ_book / N are optional; see ``book_vol_by_key`` / ``n_qual_by_key`` above.
+        # Breadth exponent (0.5 = √N) is configurable via ``MAD_INDEX_BREADTH_EXPONENT``.
+        breadth_exp = float(
+            getattr(weight_cfg, "breadth_exponent", DEFAULT_BREADTH_EXPONENT)
+        )
+        raw: dict[str, float] = {}
+        for k in passing:
+            tilt = abs(float(mrat_scores[k]) - 1.0)
+            vol: float | None = None
+            if book_vol_by_key is not None:
+                bv = book_vol_by_key.get(k)
+                if bv is not None and np.isfinite(bv) and bv > 0:
+                    vol = float(bv)
+            if vol is None and rvol_by_key is not None:
+                ev = rvol_by_key.get(k)
+                if ev is not None and np.isfinite(ev) and ev > 0:
+                    vol = float(ev)
+            inv_vol = (1.0 / vol) if vol is not None else 1.0
+            n_eff: float | None = None
+            if n_qual_by_key is not None:
+                nv = n_qual_by_key.get(k)
+                if nv is not None and np.isfinite(nv):
+                    n_eff = float(nv)
+            breadth = float(max(1.0, n_eff) ** breadth_exp) if n_eff is not None else 1.0
+            raw[k] = tilt * inv_vol * breadth
+        tot_raw = float(sum(raw.values()))
+        if tot_raw <= 0.0 or not np.isfinite(tot_raw):
+            inner = {k: 1.0 / n_pass for k in passing}
+        else:
+            inner = {k: raw[k] / tot_raw for k in passing}
     else:
         # Reuse stock-level weighting engine on the passing-index subset.
         # Long-only interpretation: entry_signal = +1 for every passer.
@@ -360,6 +451,7 @@ def build_index_allocation_series(
     ohlcv_dir: Path,
     aggregate_to_daily: bool,
     prefer_precomputed_sma: bool = False,
+    redistribute_to_survivors: bool = False,
 ) -> IndexAllocationSeries:
     """Compute per-date index + risk-off weights for the backtest calendar.
 
@@ -449,6 +541,7 @@ def build_index_allocation_series(
             trend_ok=trend_row,
             weight_cfg=weight_cfg,
             rvol_by_key=rvol_row,
+            redistribute_to_survivors=redistribute_to_survivors,
         )
         row = {c: per_idx.get(c, 0.0) for c in etf_cols}
         row[RISK_OFF_KEY] = risk_off
@@ -477,6 +570,7 @@ def evaluate_index_allocation_live(
     ohlcv_dir: Path,
     aggregate_to_daily: bool,
     prefer_precomputed_sma: bool = False,
+    redistribute_to_survivors: bool = False,
 ) -> IndexAllocationState:
     """Live snapshot allocation using each ETF's latest available bar (no shift)."""
     if not slots:
@@ -552,6 +646,7 @@ def evaluate_index_allocation_live(
         trend_ok=trend_ok_live,
         weight_cfg=weight_cfg,
         rvol_by_key=rvol_live,
+        redistribute_to_survivors=redistribute_to_survivors,
     )
     return IndexAllocationState(
         index_weights=idx_weights,
@@ -560,6 +655,67 @@ def evaluate_index_allocation_live(
         index_mrat=mrat_live,
         per_index_detail=per_idx_detail,
     )
+
+
+def book_vol_from_weights(
+    weights: dict[str, float],
+    *,
+    granularity: str,
+    ohlcv_dir: Path,
+    aggregate_to_daily: bool,
+    lookback: int,
+) -> float:
+    """Realized daily vol of a *held book* for the live ``mrat_breadth_risk_parity``
+    allocator.
+
+    Builds the weighted daily-return series of the names in ``weights`` (current
+    within-sleeve weights, renormalized) and returns its trailing ``lookback``-day
+    sample std. This mirrors the backtest, which measures each slot's realized
+    book-return vol from ``per_slot_returns`` — so a thin, concentrated sleeve is
+    scored on the risk of what it actually holds, not the ETF proxy. Returns
+    ``NaN`` when there are no names or insufficient history (caller then falls
+    back to ETF rvol)."""
+    pairs = [
+        (str(k).strip().upper(), abs(float(v)))
+        for k, v in (weights or {}).items()
+        if abs(float(v)) > 1e-12
+    ]
+    if not pairs:
+        return float("nan")
+    cols: dict[str, pd.Series] = {}
+    wts: dict[str, float] = {}
+    for nm, w in pairs:
+        try:
+            close, _ = _load_daily_close_and_sma(
+                nm,
+                granularity,
+                ohlcv_dir,
+                2,
+                aggregate_to_daily=aggregate_to_daily,
+                prefer_precomputed_sma=False,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if close is None or close.empty:
+            continue
+        ret = close.astype(float).pct_change()
+        if ret.dropna().empty:
+            continue
+        cols[nm] = ret
+        wts[nm] = w
+    if not cols:
+        return float("nan")
+    w_tot = float(sum(wts.values()))
+    if w_tot <= 0.0:
+        return float("nan")
+    ret_df = pd.concat(cols, axis=1).sort_index()
+    w_vec = pd.Series({nm: wts[nm] / w_tot for nm in cols})
+    book_ret = (ret_df[list(cols.keys())] * w_vec).sum(axis=1, min_count=1)
+    tail = book_ret.dropna().tail(max(2, int(lookback)))
+    if len(tail) < max(2, int(lookback) // 2):
+        return float("nan")
+    v = float(tail.std(ddof=1))
+    return v if np.isfinite(v) else float("nan")
 
 
 # ---------------------------------------------------------------------------

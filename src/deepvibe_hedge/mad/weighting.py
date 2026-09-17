@@ -61,6 +61,11 @@ DEFAULT_SCHEME = "equal"
 DEFAULT_SOFTMAX_TAU = 0.02
 DEFAULT_REALIZED_VOL_LOOKBACK = 20
 DEFAULT_EQUAL_BLEND = 0.0
+# Breadth exponent for the index-level ``mrat_breadth_risk_parity`` scheme:
+# sleeve weight ∝ ... × N_qualifiers ** exponent. 0.5 = √N (vol of an
+# equal-weight book scales ~1/√N); raise toward 1.0 (linear) to penalize thin
+# sleeves harder, >1.0 to all but exclude them.
+DEFAULT_BREADTH_EXPONENT = 0.5
 
 
 @dataclass(frozen=True)
@@ -92,6 +97,7 @@ class WeightConfig:
     equal_blend: float = DEFAULT_EQUAL_BLEND
     softmax_tau: float = DEFAULT_SOFTMAX_TAU
     realized_vol_lookback: int = DEFAULT_REALIZED_VOL_LOOKBACK
+    breadth_exponent: float = DEFAULT_BREADTH_EXPONENT
 
 
 # ---------------------------------------------------------------------------

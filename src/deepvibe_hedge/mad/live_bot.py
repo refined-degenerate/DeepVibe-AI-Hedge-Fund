@@ -456,6 +456,96 @@ def _desired_qty_signed(
     return float(int(math.copysign(int(math.floor(mag)), usd)))
 
 
+def _reconcile_one_universe_ticker(
+    trading_client: TradingClient,
+    t: str,
+    *,
+    snap,
+    gross: float,
+    min_order_usd: float,
+    sleeve_syms: set[str],
+    use_sleeve: bool,
+    ext_hrs: bool,
+    paper: bool,
+    frac: bool,
+) -> None:
+    """Size/print/reconcile one MRAT universe ticker (raises on unexpected Alpaca errors)."""
+    w = snap.weight_by_ticker.get(t, 0.0)
+    if t in sleeve_syms and use_sleeve:
+        return
+    px = snap.close_by_ticker.get(t, float("nan"))
+    leg_usd = abs(w) * gross
+    if abs(w) > 1e-12 and leg_usd < float(min_order_usd):
+        desired = 0.0
+        note = f" | skipped leg ${leg_usd:.2f} < min_order"
+    else:
+        desired = _desired_qty_signed(w, gross, px, fractional=frac)
+        note = ""
+
+    cur_f = float(_get_current_qty(trading_client, t))
+    cur = _round_alpaca_qty(cur_f) if frac else int(round(cur_f))
+    zero_pos = (
+        abs(float(desired)) < 1e-8 and abs(float(cur)) < 1e-8
+        if frac
+        else int(desired) == 0 and int(cur) == 0
+    )
+    if zero_pos:
+        if abs(w) > 1e-12:
+            px_disp = f"{px:.4f}" if np.isfinite(px) and px > 0 else "nan"
+            zd = _fmt_net_qty(0, fractional=frac)
+            zc = _fmt_net_qty(0, fractional=frac)
+            if note:
+                print(f"  {t}: w={w:+.4f} px={px_disp} desired_net={zd} current={zc}{note}")
+            elif not np.isfinite(px) or px <= 0:
+                print(
+                    f"  {t}: w={w:+.4f} px={px_disp} desired_net={zd} current={zc} "
+                    f"| skipped (invalid price for sizing)"
+                )
+            elif not frac:
+                print(
+                    f"  {t}: w={w:+.4f} px={px_disp} desired_net={zd} current={zc} "
+                    f"| skipped whole-share floor (${leg_usd:.2f} alloc < 1 share @ ${px:.2f})"
+                )
+            else:
+                print(
+                    f"  {t}: w={w:+.4f} px={px_disp} desired_net={zd} current={zc} "
+                    f"| skipped (target rounds to 0 shares)"
+                )
+        return
+
+    dq_clamped, short_note = _apply_live_short_constraints(
+        trading_client, t, desired, fractional=frac
+    )
+    cd = _fmt_net_qty(dq_clamped, fractional=frac)
+    cc = _fmt_net_qty(cur, fractional=frac)
+    print(
+        f"  {t}: w={w:+.4f} px={px:.4f} desired_net={cd} current={cc}{short_note}{note}"
+    )
+    if dq_clamped != desired and short_note:
+        desired = float(dq_clamped) if frac else int(dq_clamped)
+
+    ref_px = (
+        px
+        if np.isfinite(px) and px > 0 and (ext_hrs or frac)
+        else None
+    )
+    need_rec = (
+        abs(float(desired) - float(cur)) >= 1e-8
+        if frac
+        else int(round(desired)) != int(cur)
+    )
+    if need_rec:
+        _reconcile_one_symbol_or_continue(
+            trading_client,
+            t,
+            desired,
+            extended_hours=ext_hrs,
+            reference_price=ref_px,
+            paper=paper,
+            fractional=frac,
+        )
+
+
 def _reconcile_one_symbol_or_continue(
     trading_client: TradingClient,
     symbol: str,
@@ -684,79 +774,25 @@ def _run_cycle(
         )
     else:
         for t in snap.tickers:
-            w = snap.weight_by_ticker.get(t, 0.0)
-            if t in sleeve_syms and use_sleeve:
-                continue
-            px = snap.close_by_ticker.get(t, float("nan"))
-            leg_usd = abs(w) * gross
-            if abs(w) > 1e-12 and leg_usd < float(min_order_usd):
-                desired = 0.0
-                note = f" | skipped leg ${leg_usd:.2f} < min_order"
-            else:
-                desired = _desired_qty_signed(w, gross, px, fractional=frac)
-                note = ""
-
-            cur_f = float(_get_current_qty(trading_client, t))
-            cur = _round_alpaca_qty(cur_f) if frac else int(round(cur_f))
-            zero_pos = (
-                abs(float(desired)) < 1e-8 and abs(float(cur)) < 1e-8
-                if frac
-                else int(desired) == 0 and int(cur) == 0
-            )
-            if zero_pos:
-                if abs(w) > 1e-12:
-                    px_disp = f"{px:.4f}" if np.isfinite(px) and px > 0 else "nan"
-                    zd = _fmt_net_qty(0, fractional=frac)
-                    zc = _fmt_net_qty(0, fractional=frac)
-                    if note:
-                        print(f"  {t}: w={w:+.4f} px={px_disp} desired_net={zd} current={zc}{note}")
-                    elif not np.isfinite(px) or px <= 0:
-                        print(
-                            f"  {t}: w={w:+.4f} px={px_disp} desired_net={zd} current={zc} "
-                            f"| skipped (invalid price for sizing)"
-                        )
-                    elif not frac:
-                        print(
-                            f"  {t}: w={w:+.4f} px={px_disp} desired_net={zd} current={zc} "
-                            f"| skipped whole-share floor (${leg_usd:.2f} alloc < 1 share @ ${px:.2f})"
-                        )
-                    else:
-                        print(
-                            f"  {t}: w={w:+.4f} px={px_disp} desired_net={zd} current={zc} "
-                            f"| skipped (target rounds to 0 shares)"
-                        )
-                continue
-
-            dq_clamped, short_note = _apply_live_short_constraints(
-                trading_client, t, desired, fractional=frac
-            )
-            cd = _fmt_net_qty(dq_clamped, fractional=frac)
-            cc = _fmt_net_qty(cur, fractional=frac)
-            print(
-                f"  {t}: w={w:+.4f} px={px:.4f} desired_net={cd} current={cc}{short_note}{note}"
-            )
-            if dq_clamped != desired and short_note:
-                desired = float(dq_clamped) if frac else int(dq_clamped)
-
-            ref_px = (
-                px
-                if np.isfinite(px) and px > 0 and (ext_hrs or frac)
-                else None
-            )
-            need_rec = (
-                abs(float(desired) - float(cur)) >= 1e-8
-                if frac
-                else int(round(desired)) != int(cur)
-            )
-            if need_rec:
-                _reconcile_one_symbol_or_continue(
+            try:
+                _reconcile_one_universe_ticker(
                     trading_client,
                     t,
-                    desired,
-                    extended_hours=ext_hrs,
-                    reference_price=ref_px,
+                    snap=snap,
+                    gross=gross,
+                    min_order_usd=min_order_usd,
+                    sleeve_syms=sleeve_syms,
+                    use_sleeve=use_sleeve,
+                    ext_hrs=ext_hrs,
                     paper=paper,
-                    fractional=frac,
+                    frac=frac,
+                )
+            except Exception as exc:
+                sym = str(t).strip().upper()
+                print(
+                    f"  [{sym}] reconcile pass failed — skipping this symbol, "
+                    f"continuing batch: {exc}",
+                    flush=True,
                 )
 
     # Sleeve reconcile: iterate every ticker that could be held as part of the risk-off
@@ -772,69 +808,79 @@ def _run_cycle(
         sleeve_candidates.discard(rt_s)
 
     for sleeve_sym in sorted(sleeve_candidates):
-        # MRAT universe tickers are already reconciled above — only here when the symbol
-        # is sleeve-only (e.g. BIL / GLD / TLT not in MAD_UNIVERSE_TICKERS).
-        if sleeve_sym in snap.tickers:
-            continue
-        sleeve_px = _sleeve_market_price(sleeve_sym, paper=paper)
-        if use_sleeve and sleeve_sym in sleeve_targets:
-            sw = float(sleeve_targets[sleeve_sym])
-            sleeve_leg_usd = float(sleeve_notional) * abs(sw)
-            if sleeve_leg_usd < float(min_order_usd):
-                sleeve_desired = 0.0
-                sleeve_note = f" | skipped sleeve leg ${sleeve_leg_usd:.2f} < min_order"
+        try:
+            # MRAT universe tickers are already reconciled above — only here when the symbol
+            # is sleeve-only (e.g. BIL / GLD / TLT not in MAD_UNIVERSE_TICKERS).
+            if sleeve_sym in snap.tickers:
+                continue
+            sleeve_px = _sleeve_market_price(sleeve_sym, paper=paper)
+            if use_sleeve and sleeve_sym in sleeve_targets:
+                sw = float(sleeve_targets[sleeve_sym])
+                sleeve_leg_usd = float(sleeve_notional) * abs(sw)
+                if sleeve_leg_usd < float(min_order_usd):
+                    sleeve_desired = 0.0
+                    sleeve_note = f" | skipped sleeve leg ${sleeve_leg_usd:.2f} < min_order"
+                else:
+                    sleeve_desired = _desired_qty_signed(
+                        math.copysign(1.0, sw) if abs(sw) > 1e-12 else 0.0,
+                        sleeve_leg_usd,
+                        sleeve_px,
+                        fractional=frac,
+                    )
+                    sleeve_note = ""
             else:
-                sleeve_desired = _desired_qty_signed(
-                    math.copysign(1.0, sw) if abs(sw) > 1e-12 else 0.0,
-                    sleeve_leg_usd,
-                    sleeve_px,
+                sleeve_desired = 0.0
+                sleeve_note = ""
+            cur_f = float(_get_current_qty(trading_client, sleeve_sym))
+            cur_sl = _round_alpaca_qty(cur_f) if frac else int(round(cur_f))
+            need_print = bool(sleeve_note) or (
+                abs(float(sleeve_desired) - float(cur_sl)) >= 1e-8
+                if frac
+                else int(round(sleeve_desired)) != int(cur_sl)
+            )
+            if need_print:
+                px_disp = (
+                    f"{sleeve_px:.4f}"
+                    if np.isfinite(sleeve_px) and sleeve_px > 0
+                    else "market"
+                )
+                bd = _fmt_net_qty(sleeve_desired, fractional=frac)
+                bc = _fmt_net_qty(cur_sl, fractional=frac)
+                state_s = (
+                    f"risk-off w={sleeve_targets.get(sleeve_sym, 0.0):+.2%}"
+                    if use_sleeve and sleeve_sym in sleeve_targets
+                    else "flat (risk-on or not targeted)"
+                )
+                print(
+                    f"  {sleeve_sym}: sleeve={state_s} "
+                    f"quote={px_disp} desired_net={bd} current={bc}{sleeve_note}"
+                )
+            ref_px = (
+                sleeve_px
+                if np.isfinite(sleeve_px) and sleeve_px > 0 and (ext_hrs or frac)
+                else None
+            )
+            need_rec = (
+                abs(float(sleeve_desired) - float(cur_sl)) >= 1e-8
+                if frac
+                else int(round(sleeve_desired)) != int(cur_sl)
+            )
+            if need_rec:
+                _reconcile_one_symbol_or_continue(
+                    trading_client,
+                    sleeve_sym,
+                    sleeve_desired,
+                    extended_hours=ext_hrs,
+                    reference_price=ref_px,
+                    paper=paper,
                     fractional=frac,
                 )
-                sleeve_note = ""
-        else:
-            sleeve_desired = 0.0
-            sleeve_note = ""
-        cur_f = float(_get_current_qty(trading_client, sleeve_sym))
-        cur_sl = _round_alpaca_qty(cur_f) if frac else int(round(cur_f))
-        need_print = bool(sleeve_note) or (
-            abs(float(sleeve_desired) - float(cur_sl)) >= 1e-8
-            if frac
-            else int(round(sleeve_desired)) != int(cur_sl)
-        )
-        if need_print:
-            px_disp = (
-                f"{sleeve_px:.4f}" if np.isfinite(sleeve_px) and sleeve_px > 0 else "market"
-            )
-            bd = _fmt_net_qty(sleeve_desired, fractional=frac)
-            bc = _fmt_net_qty(cur_sl, fractional=frac)
-            state_s = (
-                f"risk-off w={sleeve_targets.get(sleeve_sym, 0.0):+.2%}"
-                if use_sleeve and sleeve_sym in sleeve_targets
-                else "flat (risk-on or not targeted)"
-            )
+        except Exception as exc:
+            sym = str(sleeve_sym).strip().upper()
             print(
-                f"  {sleeve_sym}: sleeve={state_s} "
-                f"quote={px_disp} desired_net={bd} current={bc}{sleeve_note}"
-            )
-        ref_px = (
-            sleeve_px
-            if np.isfinite(sleeve_px) and sleeve_px > 0 and (ext_hrs or frac)
-            else None
-        )
-        need_rec = (
-            abs(float(sleeve_desired) - float(cur_sl)) >= 1e-8
-            if frac
-            else int(round(sleeve_desired)) != int(cur_sl)
-        )
-        if need_rec:
-            _reconcile_one_symbol_or_continue(
-                trading_client,
-                sleeve_sym,
-                sleeve_desired,
-                extended_hours=ext_hrs,
-                reference_price=ref_px,
-                paper=paper,
-                fractional=frac,
+                f"  [{sym}] sleeve reconcile pass failed — skipping this symbol, "
+                f"continuing batch: {exc}",
+                flush=True,
             )
 
 

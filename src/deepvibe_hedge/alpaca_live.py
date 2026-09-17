@@ -36,11 +36,18 @@ def _alpaca_short_sale_forbidden(exc: BaseException) -> bool:
     return "42210000" in raw or "cannot be sold short" in low
 
 
+def _alpaca_symbol_not_found(exc: BaseException) -> bool:
+    raw = str(exc)
+    low = raw.lower()
+    return "40410000" in raw or "symbol not found" in low
+
+
 def _get_current_qty(trading_client: TradingClient, symbol: str) -> float:
     try:
         pos = trading_client.get_open_position(symbol)
     except APIError as exc:
-        if "position does not exist" in str(exc).lower():
+        low = str(exc).lower()
+        if "position does not exist" in low or _alpaca_symbol_not_found(exc):
             return 0.0
         raise
     return float(pos.qty)

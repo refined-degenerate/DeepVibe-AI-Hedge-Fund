@@ -70,7 +70,6 @@ sp500 = (
     "BLK",
     "BX",
     "XYZ",
-    "BK",
     "BA",
     "BKNG",
     "BSX",
